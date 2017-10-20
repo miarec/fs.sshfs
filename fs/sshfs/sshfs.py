@@ -153,6 +153,9 @@ class SSHFS(FS):
             message = "Unable to create filesystem: {}".format(e)
             raise errors.CreateFailed(message)
 
+    def __del__(self):
+        self.close()
+
     def close(self):  # noqa: D102
         self._client.close()
         super(SSHFS, self).close()
