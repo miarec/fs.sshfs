@@ -6,8 +6,6 @@ from __future__ import absolute_import
 
 import io
 import os
-import pwd
-import grp
 import stat
 import socket
 
@@ -24,41 +22,8 @@ from ..permissions import Permissions
 from ..osfs import OSFS
 from ..mode import Mode
 
+from .file import SSHFile
 from .error_tools import convert_sshfs_errors
-from .enums import Platform
-
-
-class _SSHFileWrapper(RawWrapper):
-    """A file on a remote SSH server.
-    """
-
-    def seek(self, offset, whence=0):  # noqa: D102
-        if whence > 2:
-            raise ValueError("invalid whence "
-                             "({}, should be 0, 1 or 2)".format(whence))
-        self._f.seek(offset, whence)
-        return self.tell()
-
-    def read(self, size=-1):  # noqa: D102
-        size = None if size==-1 else size
-        return self._f.read(size)
-
-    def readline(self, size=-1):  # noqa: D102
-        size = None if size==-1 else size
-        return self._f.readline(size)
-
-    def truncate(self, size=None):  # noqa: D102
-        size = size if size is not None else self._f.tell()  # SFTPFile doesn't support
-        self._f.truncate(size)                               # truncate without argument
-        return size
-
-    def readlines(self, hint=-1):  # noqa: D102
-        hint = None if hint==-1 else hint
-        return self._f.readlines(hint)
-
-    @staticmethod
-    def fileno():  # noqa: D102
-        raise io.UnsupportedOperation('fileno')
 
 
 class SSHFS(FS):
@@ -136,7 +101,8 @@ class SSHFS(FS):
             client.load_system_host_keys()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(
-                host, port, user, passwd, pkey=pkey, key_filename=keyfile,
+                socket.gethostbyname(host), port, user, passwd,
+                pkey=pkey, key_filename=keyfile,
                 look_for_keys=True if (pkey and keyfile) is None else False,
                 compress=compress, timeout=timeout
             )
@@ -238,10 +204,11 @@ class SSHFS(FS):
             elif self.isdir(_path):
                 raise errors.FileExpected(path)
             with convert_sshfs_errors('openbin', path):
-                return _SSHFileWrapper(self._sftp.open(
+                return SSHFile(self._sftp.open(
                     _path,
                     mode=_mode.to_platform_bin(),
-                    bufsize=buffering))
+                    bufsize=buffering
+                ))
 
     def remove(self, path):  # noqa: D102
         self.check()
@@ -332,19 +299,18 @@ class SSHFS(FS):
         """
         uname_sys = self._exec_command("uname -s")
         sysinfo = self._exec_command("sysinfo")
-
-        if sysinfo is not None and sysinfo:
-            return Platform.Windows
-
-        elif uname_sys is not None:
-            if uname_sys.endswith(b"BSD") or uname_sys == b"DragonFly":
-                return Platform.BSD
+        if uname_sys is not None:
+            if uname_sys == b"FreeBSD":
+                return "freebsd"
             elif uname_sys == b"Darwin":
-                return Platform.Darwin
+                return "darwin"
             elif uname_sys == b"Linux":
-                return Platform.Linux
-
-        return Platform._Unknown
+                return "linux"
+            elif uname_sys.startswith(b"CYGWIN"):
+                return "cygwin"
+        elif sysinfo is not None and sysinfo:
+            return "win32"
+        return "unknown"
 
     def _guess_locale(self):
         """Guess the locale of the remote server.
@@ -352,7 +318,7 @@ class SSHFS(FS):
         Returns:
             str: the guessed locale.
         """
-        if self.platform in Platform.Unix:
+        if self.platform in ("linux", "darwin", "freebsd"):
             locale = self._exec_command('locale charmap')
             if locale is not None:
                 return locale.decode('ascii').lower()
@@ -390,8 +356,7 @@ class SSHFS(FS):
         }
 
         details['created'] = getattr(stat_result, 'st_birthtime', None)
-        ctime_key = 'created' if self.platform is Platform.Windows \
-               else 'metadata_changed'
+        ctime_key = 'created' if self.platform=="win32" else 'metadata_changed'
         details[ctime_key] = getattr(stat_result, 'st_ctime', None)
         return details
 
@@ -403,22 +368,13 @@ class SSHFS(FS):
         access['gid'] = stat_result.st_gid
         access['uid'] = stat_result.st_uid
 
-        if self.platform in Platform.Unix:
-
-            targets = [
-                {'db': 'group', 'id': access['gid'], 'len': 4, 'key': 'group',
-                 'name': lambda g: grp.struct_group(g).gr_name},
-                {'db': 'passwd', 'id': access['uid'], 'len': 7, 'key': 'user',
-                 'name': lambda g: pwd.struct_passwd(g).pw_name},
-            ]
-
-            for target in targets:
-                getent = self._exec_command(
-                    'getent {db} {id}'.format(**target)).split(b':')
-                if len(getent) < target['len']:
-                    getent += [b''] * (target['len'] - len(getent))
-                access[target['key']] = \
-                    target['name'](getent).decode(self.locale or 'utf-8')
+        if self.platform in ("linux", "darwin", "freebsd"):
+            def entry_name(db, _id):
+                entry = self._exec_command('getent {} {}'.format(db, _id))
+                name = next(iter(entry.split(b':')))
+                return name.decode(self.locale or 'utf-8')
+            access['group'] = entry_name('group', access['gid'])
+            access['user'] = entry_name('passwd', access['uid'])
 
         return access
 
